@@ -93,6 +93,7 @@ class Ord v => IsValue v where
   valueDist   :: v -> v -> v                         -- ^ @|a - b|@
   valueRatio  :: v -> v -> Double                    -- ^ @a / b@
   valueAdjust :: Rounding -> Double -> v -> Maybe v  -- ^ @a * b@
+  valueDiv    :: v -> Int -> v                       -- ^ @a / n@
 
 class ( Ord (Input dom)
       , IsValue (Value dom)

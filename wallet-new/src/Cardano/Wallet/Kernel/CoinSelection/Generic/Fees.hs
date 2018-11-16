@@ -89,33 +89,96 @@ senderPaysFee :: (Monad m, CoinSelDom (Dom utxo))
                    ([CoinSelResult (Dom utxo)], SelectedUtxo (Dom utxo), Value (Dom utxo))
 senderPaysFee feeOptions pickUtxo totalFee css = do
     let (css', remainingFee) = feeFromChange totalFee css
-    let feeReduction = unsafeFeeSub totalFee remainingFee
-    let adjustedRemainingFees u = fromMaybe (Fee valueZero) $
-          feeSub (feeUpperBoundAdjusted feeOptions css u) feeReduction
-        _ = adjustedRemainingFees emptySelection
-    (additionalUtxo, additionalChange, _feesHistory) <-
-        coverRemainingFee pickUtxo adjustedRemainingFees remainingFee
+    -- unsafe because it's the remaining. These are the fees css' has payed.
+    let feePayed = unsafeFeeSub totalFee remainingFee
+    let adjustedEstimatedFees = feeUpperBoundAdjusted feeOptions -- c u
+    let adjustedPayedFees u = unsafeValueAdd (getFee feePayed) (selectedBalance u)
+    -- we pick some inputs, until we cover all fees and we have a positive change.
+    -- After picking each input, we readjust the fees by applying the partial function.
+    (additionalUtxo, additionalChange) <-
+        coverRemainingFee pickUtxo (adjustedEstimatedFees css') adjustedPayedFees
+    -- at this point we have a positive change, but we are not done yet. If we
+    -- return the whole change, we may create new fees which we can't cover.
+    -- On the other hand if we return none, this is for sure an accepted tx,
+    -- but we may have payed huge fees. The truth lies in the middle: we can do
+    -- binary search.
+    let css'' = binarySearch (\c -> getFee $ adjustedEstimatedFees c additionalUtxo) css' additionalChange
     return (css', additionalUtxo, additionalChange)
 
 
 coverRemainingFee :: forall utxo m. (Monad m, CoinSelDom (Dom utxo))
                   => (Value (Dom utxo) -> CoinSelT utxo CoinSelHardErr m (Maybe (UtxoEntry (Dom utxo))))
                   -> (SelectedUtxo (Dom utxo) -> Fee (Dom utxo))
-                  -> Fee (Dom utxo)
-                  -> CoinSelT utxo CoinSelHardErr m (SelectedUtxo (Dom utxo), Value (Dom utxo), [Fee (Dom utxo)])
-coverRemainingFee pickUtxo adjustedRemainingFees f = go emptySelection [f] f
+                  -> (SelectedUtxo (Dom utxo) -> Value (Dom utxo))
+                  -> CoinSelT utxo CoinSelHardErr m (SelectedUtxo (Dom utxo), Value (Dom utxo))
+coverRemainingFee pickUtxo adjustedEstimatedFees adjustedPayedFees =
+    go emptySelection
   where
-    go :: SelectedUtxo (Dom utxo) -> [Fee (Dom utxo)] -> Fee (Dom utxo)
-       -> CoinSelT utxo CoinSelHardErr m (SelectedUtxo (Dom utxo), Value (Dom utxo), [Fee (Dom utxo)])
-    go !acc fs fee
-      | selectedBalance acc >= getFee fee =
-          return (acc, unsafeValueSub (selectedBalance acc) (getFee fee), fs)
-      | otherwise = do
-          mio <- (pickUtxo $ unsafeValueSub (getFee fee) (selectedBalance acc))
-          io  <- maybe (throwError CoinSelHardErrCannotCoverFee) return mio
-          let newSelected = select io acc
-          let newFees = adjustedRemainingFees newSelected
-          go newSelected (newFees: fs) newFees
+    -- we pick utxos until we have positive change.
+    go :: SelectedUtxo (Dom utxo)
+       -> CoinSelT utxo CoinSelHardErr m (SelectedUtxo (Dom utxo), Value (Dom utxo))
+    go !acc =
+      let
+          payed = adjustedPayedFees acc
+          estimated = getFee (adjustedEstimatedFees acc)
+      in if payed >= estimated
+         then return (acc, unsafeValueSub payed estimated)
+         else do
+            mio <- (pickUtxo $ unsafeValueSub estimated payed)
+            io  <- maybe (throwError CoinSelHardErrCannotCoverFee) return mio
+            let newSelected = select io acc
+            go newSelected
+
+-- we have:
+-- adjustedFees css <= change
+-- we search for the biggest c such that:
+-- adjustedFees (splitChange c css) >= change - c
+binarySearch :: forall dom. CoinSelDom dom =>
+             -> ([CoinSelResult dom] -> Value (Dom utxo))
+             -> [CoinSelResult dom]
+             -> Value (Dom utxo)
+             -> [CoinSelResult dom]
+binarySearch adjustedFees css initialValue = go
+  where
+    initialFee = adjustedFees css
+    check v =
+      let
+        css' = split v css
+        fee' = adjustedFees css'
+        newFee = unsafeValueSub fee' initialFee
+      in initialValue >= newFee
+
+    half = splitChange (div v 2) css
+
+
+splitChange :: forall dom. CoinSelDom dom
+            => Value dom -> [CoinSelResult dom] -> [CoinSelResult dom]
+splitChange = go
+  where
+    go remaining [] = error "empty coinResult"
+    go remaining [cs] =
+      let changes = coinSelChange cs
+      in [cs {coinSelChange = addToList remaining changes}]
+    go remaining css@(cs : csRest) =
+      let piece = valueDiv remaining (length css) -- length cannot be 0.
+          newRemaining = unsafeValueSub remaining piece -- unsafe because of div.
+      in case addToListMaybe piece (coinSelChange cs) of
+          Just newChanges -> cs {coinSelChange = newChanges} : go newRemaining csRest
+          Nothing        -> cs : go remaining csRest
+
+addToList :: (IsValue (Value dom)) => Value dom -> [Value dom] -> [Value dom]
+addToList v [] = [v]
+addToList v (x:xs) = case valueAdd v x of
+    Just newValue -> newValue : xs
+    Nothing        -> addToList v xs
+
+-- | same as @addToList@, but it tries to avoid to create a new change output.
+-- if it can't, it returns Nothing.
+addToListMaybe :: (IsValue (Value dom)) => Value dom -> [Value dom] -> Maybe [Value dom]
+addToListMaybe v [] = Nothing
+addToListMaybe v (x:xs) = case valueAdd v x of
+    Just newValue -> Just $ newValue : xs
+    Nothing        -> addToListMaybe v xs
 
 -- | Attempt to pay the fee from change outputs, returning any fee remaining
 --
