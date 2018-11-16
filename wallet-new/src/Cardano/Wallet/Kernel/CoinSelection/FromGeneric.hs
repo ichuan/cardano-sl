@@ -70,6 +70,7 @@ instance IsValue Core.Coin where
                                    else a `Core.unsafeSubCoin` b
   valueRatio  = \  a b -> coinToDouble a / coinToDouble b
   valueAdjust = \r d a -> coinFromDouble r (d * coinToDouble a)
+  valueDiv    = divCoin
 
 instance CoinSelDom Cardano where
   type    Input     Cardano = Core.TxIn

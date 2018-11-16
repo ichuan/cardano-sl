@@ -89,33 +89,70 @@ senderPaysFee :: (Monad m, CoinSelDom (Dom utxo))
                    ([CoinSelResult (Dom utxo)], SelectedUtxo (Dom utxo), Value (Dom utxo))
 senderPaysFee feeOptions pickUtxo totalFee css = do
     let (css', remainingFee) = feeFromChange totalFee css
+    -- unsafe because it's the remaining.
+    -- these are the fees we have payed already in css'.
     let feeReduction = unsafeFeeSub totalFee remainingFee
-    let adjustedRemainingFees u = fromMaybe (Fee valueZero) $
-          feeSub (feeUpperBoundAdjusted feeOptions css u) feeReduction
-        _ = adjustedRemainingFees emptySelection
-    (additionalUtxo, additionalChange, _feesHistory) <-
-        coverRemainingFee pickUtxo adjustedRemainingFees remainingFee
-    return (css', additionalUtxo, additionalChange)
+    -- given a coinSelection and some additional utxos which will be used,
+    -- it computes the fees needed.
+    let adjustedRemainingFees (c, u) = fromMaybe (Fee valueZero) $
+          feeSub (feeUpperBoundAdjusted feeOptions c u) feeReduction
+    -- this is the expected remaining fees of css'
+    let remainingFee' = adjustedRemainingFees (css', emptySelection)
+    (css'', additionalUtxo, _feesHistory) <-
+        coverRemainingFee pickUtxo adjustedRemainingFees (css', remainingFee)
+    return (css'', additionalUtxo)
 
 
 coverRemainingFee :: forall utxo m. (Monad m, CoinSelDom (Dom utxo))
                   => (Value (Dom utxo) -> CoinSelT utxo CoinSelHardErr m (Maybe (UtxoEntry (Dom utxo))))
-                  -> (SelectedUtxo (Dom utxo) -> Fee (Dom utxo))
+                  -> (([CoinSelResult (Dom utxo)], SelectedUtxo (Dom utxo)) -> Fee (Dom utxo))
                   -> Fee (Dom utxo)
                   -> CoinSelT utxo CoinSelHardErr m (SelectedUtxo (Dom utxo), Value (Dom utxo), [Fee (Dom utxo)])
 coverRemainingFee pickUtxo adjustedRemainingFees f = go emptySelection [f] f
   where
-    go :: SelectedUtxo (Dom utxo) -> [Fee (Dom utxo)] -> Fee (Dom utxo)
+    go :: ([CoinSelResult (Dom utxo)], SelectedUtxo (Dom utxo)) -> [Fee (Dom utxo)] -> Fee (Dom utxo)
        -> CoinSelT utxo CoinSelHardErr m (SelectedUtxo (Dom utxo), Value (Dom utxo), [Fee (Dom utxo)])
-    go !acc fs fee
-      | selectedBalance acc >= getFee fee =
-          return (acc, unsafeValueSub (selectedBalance acc) (getFee fee), fs)
+    go (css, !additionalInputs) remainingFeesHistory remainingFee
+      -- the remaining fee does not include what's payed in additionalInputs.
+      | selectedBalance additionalInputs >= getFee remainingFee =
+          return (acc, unsafeValueSub (selectedBalance additionalInputs) (getFee remainingFee), remainingFeesHistory)
       | otherwise = do
           mio <- (pickUtxo $ unsafeValueSub (getFee fee) (selectedBalance acc))
           io  <- maybe (throwError CoinSelHardErrCannotCoverFee) return mio
-          let newSelected = select io acc
-          let newFees = adjustedRemainingFees newSelected
-          go newSelected (newFees: fs) newFees
+          let newAdditionalInputs = select io additionalInputs
+          let newPayedFees = unsafeFeeAdd initialPayedFees $ selectedBalance newAdditionalInputs
+          let newEstimatedFee = adjustedEstimatedFees newSelected
+          go newSelected (newFees: remainingFeesHistory) newFees
+
+splitChange :: forall dom. CoinSelDom dom
+            => Value dom -> [CoinSelResult dom] -> [CoinSelResult dom]
+splitChange = go
+    where
+      go remaining [] = error "empty coinResult"
+      go remaining [cs] =
+        let changes = coinSelChange cs
+        in [cs {coinSelChange = addToList remaining changes}]
+      go remaining css@(cs : csRest) =
+        let piece = valueDiv remaining (length css) -- length cannot be 0.
+            newRemaining = unsafeValueSub remaining piece -- unsafe because of div.
+        in case addToListMaybe piece (coinSelChange cs) of
+            Just newChanges -> cs {coinSelChange = newChanges} : go newRemaining cs
+            Nothing        -> a : go remaining as
+
+
+addToList :: Value dom -> [Value dom] -> [Value dom]
+addToList v [] = [v]
+addToList v (x:xs) = case valueAdd v x of
+  Just newValue -> newValue : xs
+  Nothing        -> addToList v xs
+
+-- | same as @addToList@, but it tries to avoid to create a new change output.
+-- if it can't, it returns Nothing.
+addToListMaybe :: Value dom -> [Value dom] -> Maybe [Value dom]
+addToListMaybe v [] = Nothing
+addToListMaybe v (x:xs) = case valueAdd v x of
+  Just newValue -> Just $ newValue : xs
+  Nothing        -> addToList v xs
 
 -- | Attempt to pay the fee from change outputs, returning any fee remaining
 --

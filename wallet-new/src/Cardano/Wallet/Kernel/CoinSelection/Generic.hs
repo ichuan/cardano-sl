@@ -17,6 +17,7 @@ module Cardano.Wallet.Kernel.CoinSelection.Generic (
   , unsafeFeeSum
   , utxoEntryVal
   , sizeOfEntries
+  , unsafeFeeAdd
   , unsafeValueAdd
   , unsafeValueSub
   , unsafeValueSum
@@ -93,6 +94,7 @@ class Ord v => IsValue v where
   valueDist   :: v -> v -> v                         -- ^ @|a - b|@
   valueRatio  :: v -> v -> Double                    -- ^ @a / b@
   valueAdjust :: Rounding -> Double -> v -> Maybe v  -- ^ @a * b@
+  valueDiv    :: v -> Int -> v                       -- ^ @a / n@
 
 class ( Ord (Input dom)
       , IsValue (Value dom)
@@ -155,6 +157,10 @@ newtype Fee dom = Fee { getFee :: Value dom }
 
 adjustFee :: (Value dom -> Value dom) -> Fee dom -> Fee dom
 adjustFee f = Fee . f . getFee
+
+unsafeFeeAdd :: CoinSelDom dom => Fee dom -> Fee dom -> Maybe (Fee dom)
+unsafeFeeAdd (Fee x) (Fee y) = Fee $ fromMaybe (error "unsafeFeeAdd: overflow") $
+    valueAdd x y
 
 feeSub :: CoinSelDom dom => Fee dom -> Fee dom -> Maybe (Fee dom)
 feeSub (Fee x) (Fee y) = Fee <$> valueSub x y
